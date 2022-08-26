@@ -108,7 +108,7 @@ def main():
     options['W'] = io.input_int("Width", options.get('W', 512), help_message="Width of generated images")
 
     options['save_grid'] = io.input_bool("Save grid", options.get('save_grid', False), help_message="Save all generated images also as grid")
-    options['n_rows'] = 1 if not options['save_grid'] else io.input_int("Rows in grid", options.get('n_rows', options['batch_size'].copy()), help_message="Rows in grid")
+    options['n_rows'] = 1 if not options['save_grid'] else io.input_int("Rows in grid", options.get('n_rows', options['batch_size']), help_message="Rows in grid")
 
     options['seed'] = io.input_int ("Random seed", options.get('seed', -1), help_message="Prompt to render. Keep default to get current time as seed")
 

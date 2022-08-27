@@ -98,19 +98,19 @@ def main():
     options['batch_size'] = io.input_int("Batch size", options.get('batch_size', 4), help_message="How much images generated per iteration")
     options['n_iter'] = io.input_int("Iterations", options.get('n_iter', 5), help_message="Number of iterations")
 
-    options['scale'] = io.input_number("Scale", options.get('scale', 7.5), add_info="0.0..30.0", help_message="Unconditional guidance scale")
-    options['ddim_steps'] = io.input_int("Diffusion steps", options.get('ddim_steps', 80), help_message="Number of sampling steps. More - better quality.")
+    options['scale'] = io.input_number("Scale", options.get('scale', 7.5), help_message="Unconditional guidance scale. It is assumed that the larger value, the better match to prompt")
+    options['ddim_steps'] = io.input_int("Diffusion steps", options.get('ddim_steps', 80), help_message="Number of sampling steps. More - better quality. Recomended not increase more than 150")
 
     options['sampler_type'] = io.input_str("Sampler type", options.get('sampler_type', 'klms'), ['klms','plms','ddim'], help_message="Method of images sampling from random")
-    options['ddim_eta'] = 0.0 if options['sampler_type'] != 'ddim' else io.input_number("DDIM Eta", options.get('ddim_eta', 0.5), add_info="0.0..1.0", help_message="Unknown")
+    options['ddim_eta'] = 0.0 if options['sampler_type'] != 'ddim' else np.clip(io.input_number("DDIM Eta", options.get('ddim_eta', 0.5), add_info="0.0..1.0", help_message="Unknown"), 0.0, 1.0)
 
-    options['H'] = io.input_int("Height", options.get('H', 512), help_message="Height of generated images")
-    options['W'] = io.input_int("Width", options.get('W', 512), help_message="Width of generated images")
+    options['H'] = io.input_int("Height", options.get('H', 512), help_message="Height of generated images. Recomended - 512")
+    options['W'] = io.input_int("Width", options.get('W', 512), help_message="Width of generated images. Recomended - 512")
 
     options['save_grid'] = io.input_bool("Save grid", options.get('save_grid', False), help_message="Save all generated images also as grid")
     options['n_rows'] = 1 if not options['save_grid'] else io.input_int("Rows in grid", options.get('n_rows', options['batch_size']), help_message="Rows in grid")
 
-    options['seed'] = io.input_int ("Random seed", options.get('seed', -1), help_message="Prompt to render. Keep default to get current time as seed")
+    options['seed'] = io.input_int ("Random seed", options.get('seed', -1), help_message="Keep default to get current time as seed. '-1' value means that seed will be different on each run. If you want you can choose a particular seed yourself, but without changing seed, generation sequence will be the same on each run. It is useful if you want to test different settings and compare results")
 
     save_options(Path(opt.ckpt), options)
 
@@ -156,16 +156,21 @@ def main():
     else:
         sampler = DDIMSampler(model)
 
-    os.makedirs(opt.outdir, exist_ok=True)
-    outpath = opt.outdir
+    outpath = Path(opt.outdir)
+    sample_path = Path(opt.outdir+'\samples')
+
+    if not outpath.exists():
+        outpath.mkdir()
+
+    if not sample_path.exists():
+        outpath.mkdir()
 
     assert prompt is not None
     data = [batch_size * [prompt]]
 
-    sample_path = os.path.join(outpath, "samples")
-    os.makedirs(sample_path, exist_ok=True)
-    base_count = len(os.listdir(sample_path))
-    grid_count = len(os.listdir(outpath)) - 1
+    samples_files, grid_files = list(sample_path.glob('*.*')), list(outpath.glob('grid*.*'))
+    base_count = int(samples_files.pop().stem)+1 if len(samples_files) != 0 else 0
+    grid_count = int(grid_files.pop().stem.replace('grid-', ''))+1 if len(grid_files) != 0 else 0
 
     start_code = None
     precision_scope = autocast
@@ -212,7 +217,7 @@ def main():
                     for x_sample in x_samples_ddim:
                         x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                         img = Image.fromarray(x_sample.astype(np.uint8))
-                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                        img.save(str(sample_path)+f"/{base_count:05}.png")
                         base_count += 1
 
                     if save_grid:
@@ -226,7 +231,7 @@ def main():
 
                     # to image
                     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    Image.fromarray(grid.astype(np.uint8)).save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                    Image.fromarray(grid.astype(np.uint8)).save(str(outpath)+ f'/grid-{grid_count:04}.png')
                     grid_count += 1
 
                 toc = time.time()

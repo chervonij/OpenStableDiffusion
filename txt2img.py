@@ -22,7 +22,6 @@ from pathlib import Path
 import pickle
 import time
 
-import accelerate
 import k_diffusion as K
 import torch.nn as nn
 
@@ -45,6 +44,7 @@ def save_options(path, data):
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
+
 def load_model_from_config(config, ckpt, verbose=False):
     #print(f"Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location="cpu")
@@ -60,7 +60,8 @@ def load_model_from_config(config, ckpt, verbose=False):
         print("unexpected keys:")
         print(u)
 
-    model.cuda()
+    model.half()
+    #model.cuda()
     model.eval()
     return model
 
@@ -99,10 +100,14 @@ def main():
     options['n_iter'] = io.input_int("Iterations", options.get('n_iter', 5), help_message="Number of iterations")
 
     options['scale'] = io.input_number("Scale", options.get('scale', 7.5), help_message="Unconditional guidance scale. It is assumed that the larger value, the better match to prompt")
-    options['ddim_steps'] = io.input_int("Diffusion steps", options.get('ddim_steps', 80), help_message="Number of sampling steps. More - better quality. Recomended not increase more than 150")
+    options['ddim_steps'] = io.input_int("Diffusion steps", options.get('ddim_steps', 80), help_message="Number of sampling steps. More - better quality")
 
-    options['sampler_type'] = io.input_str("Sampler type", options.get('sampler_type', 'klms'), ['klms','plms','ddim'], help_message="Method of images sampling from random")
+    sampler_type_list = ['k_lms','k_dpm_2_a','k_dpm_2','k_euler_a','k_euler','k_heun', 'ddim']
+    options['sampler_type'] = io.input_str("Sampler type", options.get('sampler_type', 'k_lms'), sampler_type_list, help_message="Method of images sampling from random")
     options['ddim_eta'] = 0.0 if options['sampler_type'] != 'ddim' else np.clip(io.input_number("DDIM Eta", options.get('ddim_eta', 0.5), add_info="0.0..1.0", help_message="Unknown"), 0.0, 1.0)
+
+    options['two_pass'] = io.input_bool("Two pass", options.get('two_pass', False), help_message="Experimental. Enables second pass generated imgs throw diffusion with same prompt")
+    options['denoise_power'] = 1.0 if not options['two_pass'] else np.clip(io.input_number("Denoise power", options.get('denoise_power', 1.0), add_info="0.0..1.0", help_message="Denoise power of generated imgs. It is recommended to set values closer to 1.0. Best result on range (0.95 .. 1.0)"), 0.0, 1.0)
 
     options['H'] = io.input_int("Height", options.get('H', 512), help_message="Height of generated images. Recomended - 512")
     options['W'] = io.input_int("Width", options.get('W', 512), help_message="Width of generated images. Recomended - 512")
@@ -111,6 +116,10 @@ def main():
     options['n_rows'] = 1 if not options['save_grid'] else io.input_int("Rows in grid", options.get('n_rows', options['batch_size']), help_message="Rows in grid")
 
     options['seed'] = io.input_int ("Random seed", options.get('seed', -1), help_message="Keep default to get current time as seed. '-1' value means that seed will be different on each run. If you want you can choose a particular seed yourself, but without changing seed, generation sequence will be the same on each run. It is useful if you want to test different settings and compare results")
+
+    #backward compatibility with config files
+    if options['sampler_type'] in ['klms', 'plms']:
+        options['sampler_type'] = 'k_lms'
 
     save_options(Path(opt.ckpt), options)
 
@@ -121,6 +130,7 @@ def main():
 
     prompt, batch_size, n_iter, scale, ddim_steps = options['prompt'], options['batch_size'], options['n_iter'], options['scale'], options['ddim_steps']
     sampler_type, ddim_eta, H, W = options['sampler_type'], options['ddim_eta'], options['H'], options['W']
+    two_pass, denoise_power = options['two_pass'], options['denoise_power']
     save_grid, n_rows, seed = options['save_grid'], options['n_rows'], options['seed']
 
     #seed_everything(opt.seed)
@@ -135,24 +145,67 @@ def main():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
 
-    accelerator = accelerate.Accelerator()
-    if sampler_type == 'klms':
-        model_wrap = K.external.CompVisDenoiser(model)
-        device = accelerator.device
-        class CFGDenoiser(nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.inner_model = model
+    class CFGDenoiser(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.inner_model = model
 
-            def forward(self, x, sigma, uncond, cond, cond_scale):
-                x_in = torch.cat([x] * 2)
-                sigma_in = torch.cat([sigma] * 2)
-                cond_in = torch.cat([uncond, cond])
-                uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
-                return uncond + (cond - uncond) * cond_scale
+        def forward(self, x, sigma, uncond, cond, cond_scale):
+            x_in = torch.cat([x] * 2)
+            sigma_in = torch.cat([sigma] * 2)
+            cond_in = torch.cat([uncond, cond])
+            uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
+            return uncond + (cond - uncond) * cond_scale
 
-    elif sampler_type == 'plms':
-        sampler = PLMSSampler(model)
+    class KDiffusionSampler:
+        def __init__(self, m, sampler):
+            self.model = m
+            self.model_wrap = K.external.CompVisDenoiser(m)
+            self.schedule = sampler
+
+        def get_sampler_name(self):
+            return self.schedule
+
+        def sample(self, S, conditioning, batch_size, shape, verbose, unconditional_guidance_scale, unconditional_conditioning, eta, x_T):
+            sigmas = self.model_wrap.get_sigmas(S)
+
+            if x_T is None:
+                x_T = torch.randn([batch_size, *shape], device=sigmas.device)
+
+            x = x_T * sigmas[0]
+            model_wrap_cfg = CFGDenoiser(self.model_wrap)
+
+            samples_ddim = K.sampling.__dict__[f'sample_{self.schedule}'](model_wrap_cfg, x, sigmas, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale}, disable=False)
+
+            return samples_ddim, None
+
+        def decode_img(self, init_latent, ddim_steps, t_enc, conditioning, unconditional_conditioning, unconditional_guidance_scale, x_T=None):
+            sigmas = self.model_wrap.get_sigmas(ddim_steps)
+
+            if x_T is None:
+                x_T = torch.randn([batch_size, *shape], device=sigmas.device)
+
+            sigmas_len = max(0, ddim_steps - t_enc - 1)
+            noise = x_T * sigmas[sigmas_len]
+
+            xi = init_latent + noise
+            sigma_sched = sigmas[sigmas_len:]
+            model_wrap_cfg = CFGDenoiser(sampler.model_wrap)
+            samples_ddim = K.sampling.__dict__[f'sample_{sampler.get_sampler_name()}'](model_wrap_cfg, xi, sigma_sched, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale}, disable=False)
+            return samples_ddim
+
+    if sampler_type == 'k_lms':
+        sampler = KDiffusionSampler(model, 'lms')
+    elif sampler_type == 'k_dpm_2_a':
+        sampler = KDiffusionSampler(model,'dpm_2_ancestral')
+    elif sampler_type == 'k_dpm_2':
+        sampler = KDiffusionSampler(model,'dpm_2')
+    elif sampler_type == 'k_euler_a':
+        sampler = KDiffusionSampler(model,'euler_ancestral')
+    elif sampler_type == 'k_euler':
+        sampler = KDiffusionSampler(model,'euler')
+    elif sampler_type == 'k_heun':
+        sampler = KDiffusionSampler(model,'heun')
     else:
         sampler = DDIMSampler(model)
 
@@ -179,40 +232,51 @@ def main():
             with model.ema_scope():
                 tic = time.time()
                 all_samples = list()
-                for n in trange(n_iter, desc="Sampling", disable =not accelerator.is_main_process):
+                for n in trange(n_iter, desc="Sampling", disable=False):
                     uc = None
                     prompts = data[0]
+                    model.cond_stage_model.cuda()
                     if scale != 1.0:
                         uc = model.get_learned_conditioning(batch_size * [""])
                     if isinstance(prompts, tuple):
                         prompts = list(prompts)
                     c = model.get_learned_conditioning(prompts)
-                    shape = [C, H//f, W//f]
-                    if not sampler_type == 'klms':
-                        samples_ddim, _ = sampler.sample(S=ddim_steps,
-                                                        conditioning=c,
-                                                        batch_size=batch_size,
-                                                        shape=shape,
-                                                        verbose=False,
-                                                        unconditional_guidance_scale=scale,
-                                                        unconditional_conditioning=uc,
-                                                        eta=ddim_eta,
-                                                        x_T=start_code)
-                    else:
-                        sigmas = model_wrap.get_sigmas(ddim_steps)
-                        if start_code is not None:
-                            x = start_code
-                        else:
-                            x = torch.randn([batch_size, *shape], device=device) * sigmas[0] # for GPU draw
-                        model_wrap_cfg = CFGDenoiser(model_wrap)
-                        extra_args = {'cond': c, 'uncond': uc, 'cond_scale': scale}
-                        samples_ddim = K.sampling.sample_lms(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process)
+                    model.cond_stage_model.cpu()
 
+                    shape = [C, H//f, W//f]
+                    samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                                     conditioning=c,
+                                                     batch_size=batch_size,
+                                                     shape=shape,
+                                                     verbose=False,
+                                                     unconditional_guidance_scale=scale,
+                                                     unconditional_conditioning=uc,
+                                                     eta=ddim_eta,
+                                                     x_T=start_code)
+
+                    model.first_stage_model.cuda()
                     x_samples_ddim = model.decode_first_stage(samples_ddim)
                     x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
 
-                    if sampler_type == 'klms':
-                        x_samples_ddim = accelerator.gather(x_samples_ddim)
+
+                    torch.cuda.empty_cache()
+
+                    if two_pass:
+                        init_latent = model.get_first_stage_encoding(model.encode_first_stage(x_samples_ddim.cuda()))
+                        t_enc = int(denoise_power*ddim_steps)
+                        if sampler_type == 'ddim':
+                            t_enc = max(0, t_enc-1)
+                            z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                            samples_ddim = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=scale, unconditional_conditioning=uc,)
+                        else:
+                            samples_ddim = sampler.decode_img(init_latent, ddim_steps, t_enc, conditioning=c, unconditional_conditioning=uc, unconditional_guidance_scale=scale)
+
+                        x_samples_ddim = model.decode_first_stage(samples_ddim)
+                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                        model.first_stage_model.cpu()
+                    else:
+                        model.first_stage_model.cpu()
+
 
                     for x_sample in x_samples_ddim:
                         x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')

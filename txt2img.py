@@ -96,7 +96,7 @@ def main():
 
     options['prompt'] = io.input_str("Prompt", options.get('prompt', 'Portrait'), help_message="Prompt to render")
 
-    options['batch_size'] = io.input_int("Batch size", options.get('batch_size', 4), help_message="How much images generated per iteration")
+    options['batch_size'] = io.input_int("Batch size", options.get('batch_size', 1), help_message="How much images generated per iteration")
     options['n_iter'] = io.input_int("Iterations", options.get('n_iter', 5), help_message="Number of iterations")
 
     options['scale'] = io.input_number("Scale", options.get('scale', 7.5), help_message="Unconditional guidance scale. It is assumed that the larger value, the better match to prompt")
